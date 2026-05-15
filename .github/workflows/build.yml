@@ -28,13 +28,9 @@ jobs:
             build \
             | xcpretty || true
 
-      - name: Find framework
-        run: find ~/Library/Developer/Xcode/DerivedData -name "InfuseBypass.framework" -type d 2>/dev/null || find . -name "InfuseBypass.framework" -type d
-
       - name: Copy framework
         run: |
-          FRAMEWORK=$(find ~/Library/Developer/Xcode/DerivedData -name "InfuseBypass.framework" -type d | head -1)
-          cp -r "$FRAMEWORK" ./InfuseBypass.framework
+          cp -r ~/Library/Developer/Xcode/DerivedData/InfuseBypass-*/Build/Products/Release-appletvos/InfuseBypass.framework ./InfuseBypass.framework
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
