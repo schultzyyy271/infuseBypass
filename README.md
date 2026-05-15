@@ -1,6 +1,6 @@
 # Infuse(tvOS) bypass
 
-> Only tested on Infuse 8.1.9 version
+> Updated for 8.4.3 Version!
 
 
 ## Installation
