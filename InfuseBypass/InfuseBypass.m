@@ -9,10 +9,14 @@
 //  1. iapVersionStatus → 1 (Enterprise)
 //  2. isFeaturePurchased:tillDate: → YES (unlocks all codecs/stream types)
 //  3. iapProSource → 2 (Enterprise source value)
-//  4. FCEnvironment iapConfig → 3 (force Enterprise IAP service path)
-//  5. containerURLForSecurityApplicationGroupIdentifier: → Documents redirect
-//  6. CKContainer defaultContainer → nil
-//  7. CKContainer containerWithIdentifier: → nil
+//  4. productsAreLoading → NO
+//  5. canMakePayments → YES
+//  6. isSubscriptionTrialUsed → YES
+//  7. gracePeriodEndDate → nil
+//  8. FCEnvironment iapConfig → 3 (force Enterprise IAP service path)
+//  9. containerURLForSecurityApplicationGroupIdentifier: → Documents redirect
+// 10. CKContainer defaultContainer → nil
+// 11. CKContainer containerWithIdentifier: → nil
 //
 //  IDA findings: the demux error "Failed to open input in demuxing stream" at
 //  -[FCFFMPEGDemuxingStream open] (0x1000922d0) is gated by isFeaturePurchased:
@@ -60,6 +64,16 @@ static void swizzleClass(Class targetClass, SEL originalSel, Class hookClass, SE
         // 3. iapProSource → 2 (Enterprise source)
         swizzleInstance(iapClass, NSSelectorFromString(@"iapProSource"),
                         HookClass, @selector(hookedIapProSource));
+
+        // 4-7. Belt & suspenders — match Enterprise behavior exactly
+        swizzleInstance(iapClass, NSSelectorFromString(@"productsAreLoading"),
+                        HookClass, @selector(hookedProductsAreLoading));
+        swizzleInstance(iapClass, NSSelectorFromString(@"canMakePayments"),
+                        HookClass, @selector(hookedCanMakePayments));
+        swizzleInstance(iapClass, NSSelectorFromString(@"isSubscriptionTrialUsed"),
+                        HookClass, @selector(hookedIsSubscriptionTrialUsed));
+        swizzleInstance(iapClass, NSSelectorFromString(@"gracePeriodEndDate"),
+                        HookClass, @selector(hookedGracePeriodEndDate));
     }
 
     // ── FCEnvironment — force Enterprise IAP config ───────────────────
@@ -105,6 +119,26 @@ static void swizzleClass(Class targetClass, SEL originalSel, Class hookClass, SE
 // Hook 3 — Enterprise returns 2 for iapProSource
 - (NSInteger)hookedIapProSource {
     return 2;
+}
+
+// Hook 4 — Enterprise returns NO (products already "loaded")
+- (BOOL)hookedProductsAreLoading {
+    return NO;
+}
+
+// Hook 5 — Enterprise returns YES
+- (BOOL)hookedCanMakePayments {
+    return YES;
+}
+
+// Hook 6 — Enterprise returns YES (trial already used, skip trial flow)
+- (BOOL)hookedIsSubscriptionTrialUsed {
+    return YES;
+}
+
+// Hook 7 — Enterprise returns nil (no grace period)
+- (id)hookedGracePeriodEndDate {
+    return nil;
 }
 
 #pragma mark - Environment Hook
