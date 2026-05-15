@@ -6,17 +6,16 @@
 //  Original by tylinux — updated for 8.4.3 with IDA Pro analysis
 //
 //  Hooks:
-//  1. iapVersionStatus → 1 (Enterprise)
+//  1. iapVersionStatus → 1 (Pro active)
 //  2. isFeaturePurchased:tillDate: → YES (unlocks all codecs/stream types)
-//  3. iapProSource → 2 (Enterprise source value)
+//  3. iapProSource → 2
 //  4. productsAreLoading → NO
 //  5. canMakePayments → YES
 //  6. isSubscriptionTrialUsed → YES
 //  7. gracePeriodEndDate → nil
-//  8. FCEnvironment iapConfig → 3 (force Enterprise IAP service path)
-//  9. containerURLForSecurityApplicationGroupIdentifier: → Documents redirect
-// 10. CKContainer defaultContainer → nil
-// 11. CKContainer containerWithIdentifier: → nil
+//  8. containerURLForSecurityApplicationGroupIdentifier: → Documents redirect
+//  9. CKContainer defaultContainer → nil
+// 10. CKContainer containerWithIdentifier: → nil
 //
 //  IDA findings: the demux error "Failed to open input in demuxing stream" at
 //  -[FCFFMPEGDemuxingStream open] (0x1000922d0) is gated by isFeaturePurchased:
@@ -26,7 +25,6 @@
 #import <Foundation/Foundation.h>
 #import <objc/runtime.h>
 
-// Forward-declare for FCEnvironment hook
 @interface InfuseBypass : NSObject
 @end
 
@@ -74,15 +72,6 @@ static void swizzleClass(Class targetClass, SEL originalSel, Class hookClass, SE
                         HookClass, @selector(hookedIsSubscriptionTrialUsed));
         swizzleInstance(iapClass, NSSelectorFromString(@"gracePeriodEndDate"),
                         HookClass, @selector(hookedGracePeriodEndDate));
-    }
-
-    // ── FCEnvironment — force Enterprise IAP config ───────────────────
-    // 4. iapConfig → 3 makes the factory use InAppPurchaseServiceEnterprise
-    //    which always returns true for all features (belt-and-suspenders)
-    Class envClass = objc_getClass("FCEnvironment");
-    if (envClass) {
-        swizzleClass(envClass, NSSelectorFromString(@"iapConfig"),
-                     HookClass, @selector(hookedIapConfig));
     }
 
     // ── Container / CloudKit hooks ────────────────────────────────────
@@ -139,13 +128,6 @@ static void swizzleClass(Class targetClass, SEL originalSel, Class hookClass, SE
 // Hook 7 — Enterprise returns nil (no grace period)
 - (id)hookedGracePeriodEndDate {
     return nil;
-}
-
-#pragma mark - Environment Hook
-
-// Hook 4 — Force Enterprise IAP service: 3 = Enterprise config
-+ (NSUInteger)hookedIapConfig {
-    return 3;
 }
 
 #pragma mark - Container Hooks
