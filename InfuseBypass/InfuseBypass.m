@@ -3,105 +3,156 @@
 //  InfuseBypass
 //
 //  Updated for Infuse 8.4.3 (tvOS)
-//  Original by tylinux — updated for 8.4.3 by AI
+//  Original by tylinux — updated for 8.4.3 with IDA Pro analysis
 //
-//  Changes from 8.1.9:
-//  - FCInAppPurchaseServiceFreemium (ObjC) renamed to
-//    _TtC6infuse31InAppPurchaseServiceFreemiumSK2 (Swift/SK2)
-//  - iapVersionStatus now returns NSInteger (FCIAPVersionStatus enum), not BOOL
-//  - Hooks 2/3/4 (containerURL, CKContainer) unchanged
+//  Hooks:
+//  1. iapVersionStatus → 1 (Enterprise)
+//  2. isFeaturePurchased:tillDate: → YES (unlocks all codecs/stream types)
+//  3. iapProSource → 2 (Enterprise source value)
+//  4. FCEnvironment iapConfig → 3 (force Enterprise IAP service path)
+//  5. containerURLForSecurityApplicationGroupIdentifier: → Documents redirect
+//  6. CKContainer defaultContainer → nil
+//  7. CKContainer containerWithIdentifier: → nil
+//
+//  IDA findings: the demux error "Failed to open input in demuxing stream" at
+//  -[FCFFMPEGDemuxingStream open] (0x1000922d0) is gated by isFeaturePurchased:
+//  which validates subscriptions via StoreKit 2. iapVersionStatus alone only
+//  controls UI/analytics — isFeaturePurchased: is the actual feature gate.
 //
 #import <Foundation/Foundation.h>
 #import <objc/runtime.h>
 
+// Forward-declare for FCEnvironment hook
 @interface InfuseBypass : NSObject
 @end
+
+#pragma mark - Swizzle helper
+
+static void swizzleInstance(Class targetClass, SEL originalSel, Class hookClass, SEL swizzledSel) {
+    Method orig = class_getInstanceMethod(targetClass, originalSel);
+    Method swiz = class_getInstanceMethod(hookClass, swizzledSel);
+    if (orig && swiz) method_exchangeImplementations(orig, swiz);
+}
+
+static void swizzleClass(Class targetClass, SEL originalSel, Class hookClass, SEL swizzledSel) {
+    Method orig = class_getClassMethod(targetClass, originalSel);
+    Method swiz = class_getClassMethod(hookClass, swizzledSel);
+    if (orig && swiz) method_exchangeImplementations(orig, swiz);
+}
 
 @implementation InfuseBypass
 
 + (void)load {
     Class HookClass = InfuseBypass.class;
 
-    // 1. Hook iapVersionStatus on the SK2 Swift class (renamed in 8.4.3)
-    //    Swift mangled: _TtC6infuse31InAppPurchaseServiceFreemiumSK2
-    //    iapVersionStatus returns NSInteger (FCIAPVersionStatus enum)
-    //    Return 1 = pro active
+    // ── IAP hooks on FreemiumSK2 ──────────────────────────────────────
     Class iapClass = objc_getClass("_TtC6infuse31InAppPurchaseServiceFreemiumSK2");
     if (iapClass) {
-        Method originalIapMethod = class_getInstanceMethod(iapClass, NSSelectorFromString(@"iapVersionStatus"));
-        Method swizzledIapMethod = class_getInstanceMethod(HookClass, @selector(hookedIapVersionStatus));
-        if (originalIapMethod && swizzledIapMethod) {
-            method_exchangeImplementations(originalIapMethod, swizzledIapMethod);
-        }
+        // 1. iapVersionStatus → 1 (Enterprise)
+        swizzleInstance(iapClass, NSSelectorFromString(@"iapVersionStatus"),
+                        HookClass, @selector(hookedIapVersionStatus));
+
+        // 2. isFeaturePurchased:tillDate: → YES (CRITICAL — actual feature gate)
+        //    Without this, codecs/stream types are blocked at the demuxer level
+        swizzleInstance(iapClass, NSSelectorFromString(@"isFeaturePurchased:tillDate:"),
+                        HookClass, @selector(hookedIsFeaturePurchased:tillDate:));
+
+        // 3. iapProSource → 2 (Enterprise source)
+        swizzleInstance(iapClass, NSSelectorFromString(@"iapProSource"),
+                        HookClass, @selector(hookedIapProSource));
     }
 
-    // 2. Hook NSFileManager containerURLForSecurityApplicationGroupIdentifier:
-    //    Redirects group container lookups to app's own Documents directory.
-    //    Prevents nil URL crash on launch when sideloaded without real app groups.
+    // ── FCEnvironment — force Enterprise IAP config ───────────────────
+    // 4. iapConfig → 3 makes the factory use InAppPurchaseServiceEnterprise
+    //    which always returns true for all features (belt-and-suspenders)
+    Class envClass = objc_getClass("FCEnvironment");
+    if (envClass) {
+        swizzleClass(envClass, NSSelectorFromString(@"iapConfig"),
+                     HookClass, @selector(hookedIapConfig));
+    }
+
+    // ── Container / CloudKit hooks ────────────────────────────────────
+    // 5. Redirect group container to Documents (prevents nil URL crash)
     Class fileManagerClass = objc_getClass("NSFileManager");
-    Method originalFMMethod = class_getInstanceMethod(fileManagerClass, @selector(containerURLForSecurityApplicationGroupIdentifier:));
-    Method swizzledFMMethod = class_getInstanceMethod(HookClass, @selector(containerURLForSecurityApplicationGroupIdentifier:));
-    if (originalFMMethod && swizzledFMMethod) {
-        method_exchangeImplementations(originalFMMethod, swizzledFMMethod);
-    }
+    swizzleInstance(fileManagerClass,
+                    @selector(containerURLForSecurityApplicationGroupIdentifier:),
+                    HookClass,
+                    @selector(hookedContainerURLForSecurityApplicationGroupIdentifier:));
 
-    // 3. Hook CKContainer defaultContainer — return nil to disable CloudKit
+    // 6 & 7. Disable CloudKit (no valid entitlements when sideloaded)
     Class cloudKitClass = objc_getClass("CKContainer");
-    Method originalDefaultMethod = class_getClassMethod(cloudKitClass, @selector(defaultContainer));
-    Method swizzledDefaultMethod = class_getClassMethod(HookClass, @selector(defaultContainer));
-    if (originalDefaultMethod && swizzledDefaultMethod) {
-        method_exchangeImplementations(originalDefaultMethod, swizzledDefaultMethod);
-    }
-
-    // 4. Hook CKContainer containerWithIdentifier: — return nil to disable CloudKit
-    Method originalIdentifierMethod = class_getClassMethod(cloudKitClass, @selector(containerWithIdentifier:));
-    Method swizzledIdentifierMethod = class_getClassMethod(HookClass, @selector(containerWithIdentifier:));
-    if (originalIdentifierMethod && swizzledIdentifierMethod) {
-        method_exchangeImplementations(originalIdentifierMethod, swizzledIdentifierMethod);
-    }
+    swizzleClass(cloudKitClass, @selector(defaultContainer),
+                 HookClass, @selector(hookedDefaultContainer));
+    swizzleClass(cloudKitClass, @selector(containerWithIdentifier:),
+                 HookClass, @selector(hookedContainerWithIdentifier:));
 }
 
-// Hook 1 — return 1 (FCIAPVersionStatus pro active)
+#pragma mark - IAP Hooks
+
+// Hook 1 — FCIAPVersionStatus: 1 = Enterprise/Pro active
 - (NSInteger)hookedIapVersionStatus {
     return 1;
 }
 
-// Hook 2 — redirect group container to Documents/ApplicationGroupContainers/<group>
-- (NSURL *)containerURLForSecurityApplicationGroupIdentifier:(NSString *)groupIdentifier {
-    NSString *homeDirectory = NSHomeDirectory();
-    NSString *containerBasePath = [homeDirectory stringByAppendingPathComponent:@"Documents/ApplicationGroupContainers"];
-    NSURL *baseURL = [NSURL fileURLWithPath:containerBasePath isDirectory:YES];
-    NSURL *containerURL = [baseURL URLByAppendingPathComponent:groupIdentifier];
+// Hook 2 — The actual feature gate. IDA: FreemiumSK2's isFeaturePurchased:tillDate:
+// at 0x1007ad0a0 calls sub_1007ACED0 which validates via StoreKit 2.
+// Enterprise version at 0x1003e6654 always returns YES. We match that.
+- (BOOL)hookedIsFeaturePurchased:(long long)feature tillDate:(id *)date {
+    if (date) *date = nil;  // No expiration
+    return YES;
+}
 
-    NSFileManager *fileManager = [NSFileManager defaultManager];
-    NSString *containerPath = [containerURL path];
+// Hook 3 — Enterprise returns 2 for iapProSource
+- (NSInteger)hookedIapProSource {
+    return 2;
+}
 
-    if (![fileManager fileExistsAtPath:containerPath]) {
-        NSError *error = nil;
-        [fileManager createDirectoryAtURL:containerURL
-               withIntermediateDirectories:YES
-                                attributes:nil
-                                     error:&error];
+#pragma mark - Environment Hook
 
-        for (NSString *subpath in @[@"Library/Application Support", @"Library/Caches", @"Library/Preferences"]) {
-            NSURL *subURL = [containerURL URLByAppendingPathComponent:subpath];
-            [fileManager createDirectoryAtURL:subURL
-                   withIntermediateDirectories:YES
-                                    attributes:nil
-                                         error:&error];
+// Hook 4 — Force Enterprise IAP service: 3 = Enterprise config
++ (NSUInteger)hookedIapConfig {
+    return 3;
+}
+
+#pragma mark - Container Hooks
+
+// Hook 5 — Redirect group container to a valid writable path
+- (NSURL *)hookedContainerURLForSecurityApplicationGroupIdentifier:(NSString *)groupIdentifier {
+    NSArray *paths = NSSearchPathForDirectoriesInDomains(NSDocumentDirectory, NSUserDomainMask, YES);
+    NSString *docsPath = [paths firstObject];
+    NSString *containerPath = [docsPath stringByAppendingPathComponent:@"SharedContainer"];
+
+    if (groupIdentifier.length > 0) {
+        containerPath = [containerPath stringByAppendingPathComponent:groupIdentifier];
+    }
+
+    NSFileManager *fm = [NSFileManager defaultManager];
+    if (![fm fileExistsAtPath:containerPath]) {
+        [fm createDirectoryAtPath:containerPath
+      withIntermediateDirectories:YES
+                       attributes:nil
+                            error:nil];
+
+        // Create standard Library subdirectories
+        for (NSString *sub in @[@"Library/Application Support", @"Library/Caches", @"Library/Preferences"]) {
+            NSString *subPath = [containerPath stringByAppendingPathComponent:sub];
+            [fm createDirectoryAtPath:subPath
+          withIntermediateDirectories:YES
+                           attributes:nil
+                                error:nil];
         }
     }
 
-    return containerURL;
+    return [NSURL fileURLWithPath:containerPath isDirectory:YES];
 }
 
-// Hook 3
-+ (id)defaultContainer {
+// Hook 6
++ (id)hookedDefaultContainer {
     return nil;
 }
 
-// Hook 4
-+ (id)containerWithIdentifier:(NSString *)identifier {
+// Hook 7
++ (id)hookedContainerWithIdentifier:(NSString *)identifier {
     return nil;
 }
 
