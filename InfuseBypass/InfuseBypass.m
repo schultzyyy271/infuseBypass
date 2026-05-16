@@ -15,28 +15,10 @@
 #import <dlfcn.h>
 
 // ============================================================================
-// MARK: - Logging (writes to Documents/infuse_bypass.log + NSLog)
+// MARK: - Logging
 // ============================================================================
 
-static NSString *_bypassLogPath = nil;
-
-static void _initLog(void) {
-    NSArray *paths = NSSearchPathForDirectoriesInDomains(NSDocumentDirectory, NSUserDomainMask, YES);
-    _bypassLogPath = [[paths firstObject] stringByAppendingPathComponent:@"infuse_bypass.log"];
-    [@"" writeToFile:_bypassLogPath atomically:YES encoding:NSUTF8StringEncoding error:nil];
-}
-
-static void _writeLog(NSString *msg) {
-    NSLog(@"[InfuseBypass] %@", msg);
-    if (!_bypassLogPath) return;
-    NSString *line = [NSString stringWithFormat:@"%@ %@\n",
-        [NSDateFormatter localizedStringFromDate:[NSDate date] dateStyle:NSDateFormatterNoStyle timeStyle:NSDateFormatterMediumStyle],
-        msg];
-    NSFileHandle *fh = [NSFileHandle fileHandleForWritingAtPath:_bypassLogPath];
-    if (fh) { [fh seekToEndOfFile]; [fh writeData:[line dataUsingEncoding:NSUTF8StringEncoding]]; [fh closeFile]; }
-}
-
-#define BYPASS_LOG(fmt, ...) _writeLog([NSString stringWithFormat:@"" fmt, ##__VA_ARGS__])
+#define BYPASS_LOG(fmt, ...) NSLog(@"[InfuseBypass] " fmt, ##__VA_ARGS__)
 
 // ============================================================================
 // MARK: - Method Swizzling Helpers
@@ -209,18 +191,52 @@ static id hook_CKContainer_containerWithIdentifier(id self, SEL _cmd, NSString *
 
 #pragma mark - HTTP Stream Debugging
 
-// Monitor HTTP status codes for debugging
+// FIX: Handle missing Content-Length header
+// VLC accepts streams without Content-Length, Infuse doesn't.
+// When Content-Length is missing but HTTP 200/206, return a large fake size.
 static long long hook_readHeadersAndFetchSizeForFile(id self, SEL _cmd, void *file) {
+    // Safety check - if no file handle, can't proceed
+    if (!file) {
+        BYPASS_LOG(@"readHeadersAndFetchSizeForFile called with NULL file!");
+        return -1;
+    }
+
     long long result = orig_readHeadersAndFetchSizeForFile(self, _cmd, file);
 
+    // Get HTTP status code
+    long long status = ((long long(*)(id, SEL))objc_msgSend)(self, sel_registerName("httpStatusCode"));
+
     if (result < 0) {
-        // Get HTTP status code
-        long long status = ((long long(*)(id, SEL))objc_msgSend)(self, sel_registerName("httpStatusCode"));
         BYPASS_LOG(@"readHeadersAndFetchSizeForFile FAILED: result=%lld, HTTP status=%lld", result, status);
 
-        // If it's a 403 (Forbidden), the download URL might be expired or rate-limited
+        // Check if cancelled
+        BOOL cancelled = ((BOOL(*)(id, SEL))objc_msgSend)(self, sel_registerName("cancelled"));
+        if (cancelled) {
+            BYPASS_LOG(@"Stream was cancelled, not faking size");
+            return result;
+        }
+
+        // CRITICAL FIX: If HTTP 200/206 but no Content-Length, fake a large size
+        // This allows streaming from servers that don't send Content-Length
+        // This is the #1 difference between VLC (works) and Infuse (fails)
+        if (status == 200 || status == 206) {
+            // Return 10GB as fake size - Infuse will stream until EOF
+            // For live streams/chunked encoding, this allows playback to work
+            long long fakeSize = 10737418240LL; // 10GB
+            BYPASS_LOG(@"*** CONTENT-LENGTH FIX: HTTP %lld OK but no size - returning fake size %lld ***", status, fakeSize);
+
+            return fakeSize;
+        }
+
+        // HTTP errors
         if (status == 403 || status == 401) {
-            BYPASS_LOG(@"HTTP %lld detected - likely expired URL or rate limit", status);
+            BYPASS_LOG(@"HTTP %lld - authentication/authorization failure", status);
+        } else if (status == 404) {
+            BYPASS_LOG(@"HTTP 404 - file not found");
+        } else if (status >= 500) {
+            BYPASS_LOG(@"HTTP %lld - server error", status);
+        } else if (status == 0) {
+            BYPASS_LOG(@"HTTP 0 - connection failed or timeout");
         }
     }
 
@@ -308,7 +324,6 @@ static BOOL hook_isAboutToExpire(id self, SEL _cmd) {
 
 __attribute__((constructor))
 static void InfuseBypassInit(void) {
-    _initLog();
     BYPASS_LOG(@"Initializing Infuse 8.4.3 tvOS Sideload Bypass...");
 
     @autoreleasepool {
