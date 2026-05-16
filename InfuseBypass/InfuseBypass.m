@@ -5,51 +5,32 @@
 //  Updated for Infuse 8.4.3 (tvOS)
 //  Original by tylinux — updated for 8.4.3 with IDA Pro analysis
 //
-//  Hooks (runtime swizzle):
+//  Hooks:
 //  1. iapVersionStatus → 1 (Pro active)
-//  2. containerURLForSecurityApplicationGroupIdentifier: → Documents redirect
-//  3. CKContainer defaultContainer → nil
-//  4. CKContainer containerWithIdentifier: → nil
+//  2. isShareAvailable: → YES (fixes playback — reachability check
+//     kills connections for sideloaded apps)
+//  3. containerURLForSecurityApplicationGroupIdentifier: → Documents redirect
+//  4. CKContainer defaultContainer → nil
+//  5. CKContainer containerWithIdentifier: → nil
 //
-//  Binary patch:
-//  - hasPro at 0x10021991c → MOV W0, #1; RET (always returns YES)
-//    Bypasses Swift dispatch issues with isFeaturePurchased:tillDate:
+//  Root cause of playback failure:
+//  FCCurlConnection.connect evaluates a connectionCheck block at 0x100018ca4
+//  which calls SharesReachabilityManager.isShareAvailable: — returns false
+//  for sideloaded apps, killing the stream before FFmpeg even opens.
 //
 #import <Foundation/Foundation.h>
 #import <objc/runtime.h>
-#import <mach-o/dyld.h>
-#import <mach/mach.h>
 
 @interface InfuseBypass : NSObject
 @end
-
-#pragma mark - Binary patch helper
-
-static void patchMemory(void *addr, const void *data, size_t size) {
-    kern_return_t kr;
-    kr = vm_protect(mach_task_self(), (vm_address_t)addr, size,
-                    false, VM_PROT_READ | VM_PROT_WRITE | VM_PROT_COPY);
-    if (kr != KERN_SUCCESS) return;
-    memcpy(addr, data, size);
-    vm_protect(mach_task_self(), (vm_address_t)addr, size,
-               false, VM_PROT_READ | VM_PROT_EXECUTE);
-}
 
 @implementation InfuseBypass
 
 + (void)load {
     Class HookClass = InfuseBypass.class;
 
-    // ── Binary patch: hasPro → always YES ──────────────────────────────
-    // IDA: hasPro at 0x10021991c calls iapVersionStatus then checks > 0
-    // Swizzling isFeaturePurchased:tillDate: doesn't work (Swift dispatch)
-    // so we patch hasPro directly: MOV W0, #1; RET
-    intptr_t slide = _dyld_get_image_vmaddr_slide(0);
-    uint8_t hasProPatch[] = {0x20, 0x00, 0x80, 0x52,   // MOV W0, #1
-                             0xC0, 0x03, 0x5F, 0xD6};   // RET
-    patchMemory((void *)(0x10021991c + slide), hasProPatch, 8);
-
-    // 1. Hook iapVersionStatus → 1 (Pro active, for UI/analytics)
+    // ── IAP ───────────────────────────────────────────────────────────
+    // 1. iapVersionStatus → 1 (Pro active)
     Class iapClass = objc_getClass("_TtC6infuse31InAppPurchaseServiceFreemiumSK2");
     if (iapClass) {
         Method originalIapMethod = class_getInstanceMethod(iapClass, NSSelectorFromString(@"iapVersionStatus"));
@@ -59,41 +40,66 @@ static void patchMemory(void *addr, const void *data, size_t size) {
         }
     }
 
-    // 2. Hook NSFileManager containerURLForSecurityApplicationGroupIdentifier:
+    // ── Reachability (PLAYBACK FIX) ──────────────────────────────────
+    // 2. SharesReachabilityManager.isShareAvailable: → YES
+    //    Without this, connectionCheck block returns 0 and the curl
+    //    connection aborts before even attempting the HTTP request.
+    Class reachClass = objc_getClass("_TtC6infuse32DefaultSharesReachabilityManager");
+    if (reachClass) {
+        Method originalReachMethod = class_getInstanceMethod(reachClass, NSSelectorFromString(@"isShareAvailable:"));
+        Method swizzledReachMethod = class_getInstanceMethod(HookClass, @selector(hookedIsShareAvailable:));
+        if (originalReachMethod && swizzledReachMethod) {
+            method_exchangeImplementations(originalReachMethod, swizzledReachMethod);
+        }
+    }
+
+    // ── Container redirect ───────────────────────────────────────────
+    // 3. containerURLForSecurityApplicationGroupIdentifier: → Documents
     Class fileManagerClass = objc_getClass("NSFileManager");
     Method originalFMMethod = class_getInstanceMethod(fileManagerClass, @selector(containerURLForSecurityApplicationGroupIdentifier:));
-    Method swizzledFMMethod = class_getInstanceMethod(HookClass, @selector(containerURLForSecurityApplicationGroupIdentifier:));
+    Method swizzledFMMethod = class_getInstanceMethod(HookClass, @selector(hookedContainerURLForSecurityApplicationGroupIdentifier:));
     if (originalFMMethod && swizzledFMMethod) {
         method_exchangeImplementations(originalFMMethod, swizzledFMMethod);
     }
 
-    // 3. Hook CKContainer defaultContainer — return nil to disable CloudKit
+    // ── CloudKit disable ─────────────────────────────────────────────
+    // 4 & 5. CKContainer → nil
     Class cloudKitClass = objc_getClass("CKContainer");
     Method originalDefaultMethod = class_getClassMethod(cloudKitClass, @selector(defaultContainer));
-    Method swizzledDefaultMethod = class_getClassMethod(HookClass, @selector(defaultContainer));
+    Method swizzledDefaultMethod = class_getClassMethod(HookClass, @selector(hookedDefaultContainer));
     if (originalDefaultMethod && swizzledDefaultMethod) {
         method_exchangeImplementations(originalDefaultMethod, swizzledDefaultMethod);
     }
 
-    // 4. Hook CKContainer containerWithIdentifier: — return nil to disable CloudKit
     Method originalIdentifierMethod = class_getClassMethod(cloudKitClass, @selector(containerWithIdentifier:));
-    Method swizzledIdentifierMethod = class_getClassMethod(HookClass, @selector(containerWithIdentifier:));
+    Method swizzledIdentifierMethod = class_getClassMethod(HookClass, @selector(hookedContainerWithIdentifier:));
     if (originalIdentifierMethod && swizzledIdentifierMethod) {
         method_exchangeImplementations(originalIdentifierMethod, swizzledIdentifierMethod);
     }
 }
+
+#pragma mark - IAP
 
 // Hook 1 — return 1 (FCIAPVersionStatus pro active)
 - (NSInteger)hookedIapVersionStatus {
     return 1;
 }
 
-// Hook 2 — redirect group container to Documents/ApplicationGroupContainers/<group>
-- (NSURL *)containerURLForSecurityApplicationGroupIdentifier:(NSString *)groupIdentifier {
+#pragma mark - Reachability (playback fix)
+
+// Hook 2 — force all shares as reachable
+- (BOOL)hookedIsShareAvailable:(id)share {
+    return YES;
+}
+
+#pragma mark - Container redirect
+
+// Hook 3 — redirect group container to Documents
+- (NSURL *)hookedContainerURLForSecurityApplicationGroupIdentifier:(NSString *)groupIdentifier {
     NSString *homeDirectory = NSHomeDirectory();
     NSString *containerBasePath = [homeDirectory stringByAppendingPathComponent:@"Documents/ApplicationGroupContainers"];
     NSURL *baseURL = [NSURL fileURLWithPath:containerBasePath isDirectory:YES];
-    NSURL *containerURL = [baseURL URLByAppendingPathComponent:groupIdentifier];
+    NSURL *containerURL = [baseURL URLByAppendingPathComponent:groupIdentifier ?: @"default"];
 
     NSFileManager *fileManager = [NSFileManager defaultManager];
     NSString *containerPath = [containerURL path];
@@ -117,13 +123,15 @@ static void patchMemory(void *addr, const void *data, size_t size) {
     return containerURL;
 }
 
-// Hook 3
-+ (id)defaultContainer {
+#pragma mark - CloudKit disable
+
+// Hook 4
++ (id)hookedDefaultContainer {
     return nil;
 }
 
-// Hook 4
-+ (id)containerWithIdentifier:(NSString *)identifier {
+// Hook 5
++ (id)hookedContainerWithIdentifier:(NSString *)identifier {
     return nil;
 }
 
