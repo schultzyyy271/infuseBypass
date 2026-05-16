@@ -74,6 +74,9 @@ static id (*orig_CKContainer_containerWithIdentifier)(id self, SEL _cmd, NSStrin
 static long long (*orig_readHeadersAndFetchSizeForFile)(id self, SEL _cmd, void *file);
 static long long (*orig_httpStatusCode)(id self, SEL _cmd);
 
+// HTTP Stream read - for EOF handling
+static int (*orig_readBuffer_ofSize)(id self, SEL _cmd, char *buffer, int size);
+
 // OAuth Token
 static BOOL (*orig_isAboutToExpire)(id self, SEL _cmd);
 
@@ -195,17 +198,83 @@ static id hook_CKContainer_containerWithIdentifier(id self, SEL _cmd, NSString *
 // VLC accepts streams without Content-Length, Infuse doesn't.
 // When Content-Length is missing but HTTP 200/206, return a large fake size.
 static long long hook_readHeadersAndFetchSizeForFile(id self, SEL _cmd, void *file) {
-    if (!file) return -1;
+    // Safety check - if no file handle, can't proceed
+    if (!file) {
+        BYPASS_LOG(@"readHeadersAndFetchSizeForFile called with NULL file!");
+        return -1;
+    }
 
     long long result = orig_readHeadersAndFetchSizeForFile(self, _cmd, file);
 
-    // If original succeeded, pass through
-    if (result >= 0) return result;
+    // Get HTTP status code
+    long long status = ((long long(*)(id, SEL))objc_msgSend)(self, sel_registerName("httpStatusCode"));
 
-    // Original failed (no Content-Length/Content-Range).
-    // Instead of returning -1 (which kills the stream), return a fake size.
-    // This makes Infuse behave like VLC — stream until EOF.
-    return 10737418240LL; // 10GB fake size
+    if (result < 0) {
+        BYPASS_LOG(@"readHeadersAndFetchSizeForFile FAILED: result=%lld, HTTP status=%lld", result, status);
+
+        // Check if cancelled
+        BOOL cancelled = ((BOOL(*)(id, SEL))objc_msgSend)(self, sel_registerName("cancelled"));
+        if (cancelled) {
+            BYPASS_LOG(@"Stream was cancelled, not faking size");
+            return result;
+        }
+
+        // CRITICAL FIX: If HTTP 200/206 but no Content-Length, fake a large size
+        // This allows streaming from servers that don't send Content-Length
+        // This is the #1 difference between VLC (works) and Infuse (fails)
+        if (status == 200 || status == 206) {
+            // Return 10GB as fake size - Infuse will stream until EOF
+            // For live streams/chunked encoding, this allows playback to work
+            long long fakeSize = 10737418240LL; // 10GB
+            BYPASS_LOG(@"*** CONTENT-LENGTH FIX: HTTP %lld OK but no size - returning fake size %lld ***", status, fakeSize);
+
+            return fakeSize;
+        }
+
+        // HTTP errors
+        if (status == 403 || status == 401) {
+            BYPASS_LOG(@"HTTP %lld - authentication/authorization failure", status);
+        } else if (status == 404) {
+            BYPASS_LOG(@"HTTP 404 - file not found");
+        } else if (status >= 500) {
+            BYPASS_LOG(@"HTTP %lld - server error", status);
+        } else if (status == 0) {
+            BYPASS_LOG(@"HTTP 0 - connection failed or timeout");
+        }
+    }
+
+    return result;
+}
+
+#pragma mark - EOF Handling Fix
+
+// FIX: Handle EOF when we faked the Content-Length
+// When server sends EOF before our fake size is reached, update the size
+// to match reality instead of returning an error.
+static int hook_readBuffer_ofSize(id self, SEL _cmd, char *buffer, int size) {
+    int result = orig_readBuffer_ofSize(self, _cmd, buffer, size);
+
+    // If read returned -1, check if it's our fake size causing the issue
+    if (result == -1) {
+        // Get current offset and remote size
+        long long offset = ((long long(*)(id, SEL))objc_msgSend)(self, sel_registerName("offsetInFile"));
+        long long remoteSize = ((long long(*)(id, SEL))objc_msgSend)(self, sel_registerName("remoteFileSize"));
+
+        // If remote size is our fake 10GB and we're not there yet,
+        // this might be a legit EOF that we're treating as error
+        if (remoteSize == 10737418240LL && offset < remoteSize) {
+            BYPASS_LOG(@"EOF fix: Detected EOF at offset %lld with fake size %lld", offset, remoteSize);
+
+            // Update the remote file size to current offset (actual size)
+            ((void(*)(id, SEL, long long))objc_msgSend)(self, sel_registerName("setRemoteFileSize:"), offset);
+            BYPASS_LOG(@"EOF fix: Updated remoteFileSize to actual size %lld", offset);
+
+            // Return 0 to indicate proper EOF
+            return 0;
+        }
+    }
+
+    return result;
 }
 
 #pragma mark - Cloud Stream API Monitoring
@@ -406,6 +475,12 @@ static void InfuseBypassInit(void) {
                 sel_registerName("readHeadersAndFetchSizeForFile:"),
                 (IMP)hook_readHeadersAndFetchSizeForFile,
                 (IMP*)&orig_readHeadersAndFetchSizeForFile);
+
+            // Hook readBuffer:ofSize: to handle EOF when Content-Length was faked
+            swizzleInstanceMethod(FCHTTPInputStreamClass,
+                sel_registerName("readBuffer:ofSize:"),
+                (IMP)hook_readBuffer_ofSize,
+                (IMP*)&orig_readBuffer_ofSize);
         }
 
         // ====================================================================
