@@ -1,530 +1,80 @@
-/*
- * InfuseBypass.m - Complete Infuse 8.4.3 tvOS Sideload Fix
- *
- * Compile as a dynamic framework and inject via DYLD_INSERT_LIBRARIES
- * or use a jailbreak tweak loader.
- *
- * Build command (Theos or manual):
- *   clang -arch arm64 -shared -framework Foundation -framework UIKit \
- *         -o InfuseBypass.dylib InfuseBypass.m
- */
-
+//
+//  InfuseBypass.m — Infuse 8.4.3 tvOS Sideload Fix
+//
+//  Proven hooks + Content-Length fix for MovieBox Pro streams
+//
 #import <Foundation/Foundation.h>
 #import <objc/runtime.h>
 #import <objc/message.h>
-#import <dlfcn.h>
 
-// ============================================================================
-// MARK: - Logging
-// ============================================================================
+// Original method pointers
+static NSInteger (*orig_iapVersionStatus)(id, SEL);
+static BOOL (*orig_isShareAvailable)(id, SEL, id);
+static NSURL* (*orig_containerURL)(id, SEL, NSString*);
+static id (*orig_defaultContainer)(id, SEL);
+static id (*orig_containerWithId)(id, SEL, NSString*);
+static long long (*orig_readHeaders)(id, SEL, void*);
 
-#define BYPASS_LOG(fmt, ...) NSLog(@"[InfuseBypass] " fmt, ##__VA_ARGS__)
-
-// ============================================================================
-// MARK: - Method Swizzling Helpers
-// ============================================================================
-
-static void swizzleInstanceMethod(Class cls, SEL original, IMP replacement, IMP *outOriginal) {
-    Method method = class_getInstanceMethod(cls, original);
-    if (method) {
-        *outOriginal = method_setImplementation(method, replacement);
-        BYPASS_LOG(@"Hooked -[%@ %@]", NSStringFromClass(cls), NSStringFromSelector(original));
-    } else {
-        BYPASS_LOG(@"FAILED to hook -[%@ %@] - method not found", NSStringFromClass(cls), NSStringFromSelector(original));
-    }
+// Swizzle helpers
+static void hookInst(Class c, SEL s, IMP new, IMP *old) {
+    Method m = class_getInstanceMethod(c, s);
+    if (m) *old = method_setImplementation(m, new);
+}
+static void hookClass(Class c, SEL s, IMP new, IMP *old) {
+    Method m = class_getClassMethod(c, s);
+    if (m) *old = method_setImplementation(m, new);
 }
 
-static void swizzleClassMethod(Class cls, SEL original, IMP replacement, IMP *outOriginal) {
-    Method method = class_getClassMethod(cls, original);
-    if (method) {
-        *outOriginal = method_setImplementation(method, replacement);
-        BYPASS_LOG(@"Hooked +[%@ %@]", NSStringFromClass(cls), NSStringFromSelector(original));
-    } else {
-        BYPASS_LOG(@"FAILED to hook +[%@ %@] - method not found", NSStringFromClass(cls), NSStringFromSelector(original));
-    }
+// === Hook 1: Pro status ===
+static NSInteger h_iapVersionStatus(id self, SEL _cmd) { return 1; }
+
+// === Hook 2: Reachability bypass ===
+static BOOL h_isShareAvailable(id self, SEL _cmd, id share) { return YES; }
+
+// === Hook 3: Container redirect ===
+static NSURL* h_containerURL(id self, SEL _cmd, NSString *gid) {
+    NSArray *p = NSSearchPathForDirectoriesInDomains(NSDocumentDirectory, NSUserDomainMask, YES);
+    NSString *path = [[p firstObject] stringByAppendingPathComponent:@"AppGroup"];
+    [[NSFileManager defaultManager] createDirectoryAtPath:path
+                              withIntermediateDirectories:YES attributes:nil error:nil];
+    return [NSURL fileURLWithPath:path];
 }
 
-// ============================================================================
-// MARK: - Original Method Pointers
-// ============================================================================
+// === Hook 4 & 5: CloudKit disable ===
+static id h_defaultContainer(id self, SEL _cmd) { return nil; }
+static id h_containerWithId(id self, SEL _cmd, NSString *i) { return nil; }
 
-// IAP
-static NSInteger (*orig_iapConfig)(id self, SEL _cmd);
-static NSInteger (*orig_iapVersionStatus)(id self, SEL _cmd);
-
-// Reachability
-static BOOL (*orig_isShareAvailable)(id self, SEL _cmd, id share);
-
-// Connection Manager
-static NSInteger (*orig_maxConnections)(id self, SEL _cmd);
-
-// Stream Strategy
-static BOOL (*orig_shouldInvalidateStream)(id self, SEL _cmd, id stream);
-static BOOL (*orig_shouldInvalidateStream_GDrive)(id self, SEL _cmd, id stream);
-static BOOL (*orig_shouldInvalidateStream_Mega)(id self, SEL _cmd, id stream);
-
-// Container URL
-static NSURL* (*orig_containerURLForSecurityApplicationGroupIdentifier)(id self, SEL _cmd, NSString *groupId);
-
-// CloudKit
-static id (*orig_CKContainer_defaultContainer)(id self, SEL _cmd);
-static id (*orig_CKContainer_containerWithIdentifier)(id self, SEL _cmd, NSString *identifier);
-
-// HTTP Stream debugging
-static long long (*orig_readHeadersAndFetchSizeForFile)(id self, SEL _cmd, void *file);
-static long long (*orig_httpStatusCode)(id self, SEL _cmd);
-
-// HTTP Stream read - for EOF handling
-static int (*orig_readBuffer_ofSize)(id self, SEL _cmd, char *buffer, int size);
-
-// OAuth Token
-static BOOL (*orig_isAboutToExpire)(id self, SEL _cmd);
-
-// Cloud Stream - API call monitoring
-static id (*orig_createStreamOutError)(id self, SEL _cmd, id *outError);
-
-// FCCloudInputStream monitoring
-static BOOL (*orig_checkHTTPStreamIsValidAndSeek)(id self, SEL _cmd, BOOL seek);
-
-// FCOperation success monitoring
-static BOOL (*orig_FCOperation_isSuccessful)(id self, SEL _cmd);
-static id (*orig_FCOperation_operationError)(id self, SEL _cmd);
-
-// ============================================================================
-// MARK: - Hook Implementations
-// ============================================================================
-
-#pragma mark - IAP Bypass
-
-// FCEnvironment.iapConfig → 3 (Enterprise - bypasses all IAP checks)
-static NSInteger hook_iapConfig(id self, SEL _cmd) {
-    return 3; // 0=Free, 1=FreemiumSK2, 2=FreemiumAppStore, 3=Enterprise
-}
-
-// Return Pro status
-static NSInteger hook_iapVersionStatus(id self, SEL _cmd) {
-    return 1; // Pro
-}
-
-#pragma mark - Reachability Bypass
-
-// DefaultSharesReachabilityManager.isShareAvailable: → YES
-// This fixes the connection check in FCCurlConnection.connect:
-static BOOL hook_isShareAvailable(id self, SEL _cmd, id share) {
-    return YES;
-}
-
-#pragma mark - Connection Pool Fix
-
-// FCConnectionManager.maxConnections → 20
-// Prevents connection eviction that causes stream failures
-static NSInteger hook_maxConnections(id self, SEL _cmd) {
-    return 20; // Default is 3, which causes eviction issues
-}
-
-#pragma mark - Stream Invalidation Fix
-
-// FCCloudServiceLinkStreamStrategy.shouldInvalidateStream: → NO
-// Prevents constant stream recreation that fails on sideloaded apps
-static BOOL hook_shouldInvalidateStream(id self, SEL _cmd, id stream) {
-    // Check if link exists and is not expired
-    id link = ((id(*)(id, SEL))objc_msgSend)(self, sel_registerName("link"));
-    if (!link) {
-        // No link yet, allow creation
-        return YES;
-    }
-
-    // Check expiration
-    id expirationDate = ((id(*)(id, SEL))objc_msgSend)(link, sel_registerName("expirationDate"));
-    if (expirationDate) {
-        NSDate *now = [NSDate date];
-        NSComparisonResult cmp = [(NSDate *)expirationDate compare:now];
-        if (cmp == NSOrderedAscending) {
-            // Expired - allow refresh
-            BYPASS_LOG(@"Link expired, allowing refresh");
-            return YES;
-        }
-    }
-
-    // Not expired, don't invalidate
-    return NO;
-}
-
-// Google Drive strategy - always return NO
-static BOOL hook_shouldInvalidateStream_GDrive(id self, SEL _cmd, id stream) {
-    return NO;
-}
-
-// Mega strategy - always return NO
-static BOOL hook_shouldInvalidateStream_Mega(id self, SEL _cmd, id stream) {
-    return NO;
-}
-
-#pragma mark - Container URL Redirect
-
-// Redirect app group container to Documents folder
-static NSURL* hook_containerURLForSecurityApplicationGroupIdentifier(id self, SEL _cmd, NSString *groupId) {
-    // Sideloaded apps don't have app group entitlements
-    // Redirect to Documents directory
-    NSArray *paths = NSSearchPathForDirectoriesInDomains(NSDocumentDirectory, NSUserDomainMask, YES);
-    NSString *documentsPath = [paths firstObject];
-    NSString *fakePath = [documentsPath stringByAppendingPathComponent:@"AppGroup"];
-
-    NSFileManager *fm = [NSFileManager defaultManager];
-    if (![fm fileExistsAtPath:fakePath]) {
-        [fm createDirectoryAtPath:fakePath withIntermediateDirectories:YES attributes:nil error:nil];
-    }
-
-    BYPASS_LOG(@"Redirected container %@ to %@", groupId, fakePath);
-    return [NSURL fileURLWithPath:fakePath];
-}
-
-#pragma mark - CloudKit Bypass
-
-// Return nil for CloudKit containers (sideloaded apps can't use CloudKit)
-static id hook_CKContainer_defaultContainer(id self, SEL _cmd) {
-    BYPASS_LOG(@"CKContainer.defaultContainer → nil");
-    return nil;
-}
-
-static id hook_CKContainer_containerWithIdentifier(id self, SEL _cmd, NSString *identifier) {
-    BYPASS_LOG(@"CKContainer.containerWithIdentifier:%@ → nil", identifier);
-    return nil;
-}
-
-#pragma mark - HTTP Stream Debugging
-
-// FIX: Handle missing Content-Length header
-// VLC accepts streams without Content-Length, Infuse doesn't.
-// When Content-Length is missing but HTTP 200/206, return a large fake size.
-static long long hook_readHeadersAndFetchSizeForFile(id self, SEL _cmd, void *file) {
-    // Safety check - if no file handle, can't proceed
-    if (!file) {
-        BYPASS_LOG(@"readHeadersAndFetchSizeForFile called with NULL file!");
-        return -1;
-    }
-
-    long long result = orig_readHeadersAndFetchSizeForFile(self, _cmd, file);
-
-    // Get HTTP status code
-    long long status = ((long long(*)(id, SEL))objc_msgSend)(self, sel_registerName("httpStatusCode"));
-
-    if (result < 0) {
-        BYPASS_LOG(@"readHeadersAndFetchSizeForFile FAILED: result=%lld, HTTP status=%lld", result, status);
-
-        // Check if cancelled
-        BOOL cancelled = ((BOOL(*)(id, SEL))objc_msgSend)(self, sel_registerName("cancelled"));
-        if (cancelled) {
-            BYPASS_LOG(@"Stream was cancelled, not faking size");
-            return result;
-        }
-
-        // CRITICAL FIX: If HTTP 200/206 but no Content-Length, fake a large size
-        // This allows streaming from servers that don't send Content-Length
-        // This is the #1 difference between VLC (works) and Infuse (fails)
-        if (status == 200 || status == 206) {
-            // Return 10GB as fake size - Infuse will stream until EOF
-            // For live streams/chunked encoding, this allows playback to work
-            long long fakeSize = 10737418240LL; // 10GB
-            BYPASS_LOG(@"*** CONTENT-LENGTH FIX: HTTP %lld OK but no size - returning fake size %lld ***", status, fakeSize);
-
-            return fakeSize;
-        }
-
-        // HTTP errors
-        if (status == 403 || status == 401) {
-            BYPASS_LOG(@"HTTP %lld - authentication/authorization failure", status);
-        } else if (status == 404) {
-            BYPASS_LOG(@"HTTP 404 - file not found");
-        } else if (status >= 500) {
-            BYPASS_LOG(@"HTTP %lld - server error", status);
-        } else if (status == 0) {
-            BYPASS_LOG(@"HTTP 0 - connection failed or timeout");
-        }
-    }
-
+// === Hook 6: Content-Length fix (MovieBox Pro) ===
+// MovieBox CDN doesn't send Content-Length headers.
+// VLC streams until EOF, Infuse returns -1 and fails.
+// Fix: return fake size so stream opens, Infuse reads until EOF.
+static long long h_readHeaders(id self, SEL _cmd, void *file) {
+    if (!file) return -1;
+    long long result = orig_readHeaders(self, _cmd, file);
+    if (result < 0) return 10737418240LL; // 10GB fake
     return result;
 }
-
-#pragma mark - EOF Handling Fix
-
-// FIX: Handle EOF when we faked the Content-Length
-// When server sends EOF before our fake size is reached, update the size
-// to match reality instead of returning an error.
-static int hook_readBuffer_ofSize(id self, SEL _cmd, char *buffer, int size) {
-    int result = orig_readBuffer_ofSize(self, _cmd, buffer, size);
-
-    // If read returned -1, check if it's our fake size causing the issue
-    if (result == -1) {
-        // Get current offset and remote size
-        long long offset = ((long long(*)(id, SEL))objc_msgSend)(self, sel_registerName("offsetInFile"));
-        long long remoteSize = ((long long(*)(id, SEL))objc_msgSend)(self, sel_registerName("remoteFileSize"));
-
-        // If remote size is our fake 10GB and we're not there yet,
-        // this might be a legit EOF that we're treating as error
-        if (remoteSize == 10737418240LL && offset < remoteSize) {
-            BYPASS_LOG(@"EOF fix: Detected EOF at offset %lld with fake size %lld", offset, remoteSize);
-
-            // Update the remote file size to current offset (actual size)
-            ((void(*)(id, SEL, long long))objc_msgSend)(self, sel_registerName("setRemoteFileSize:"), offset);
-            BYPASS_LOG(@"EOF fix: Updated remoteFileSize to actual size %lld", offset);
-
-            // Return 0 to indicate proper EOF
-            return 0;
-        }
-    }
-
-    return result;
-}
-
-#pragma mark - Cloud Stream API Monitoring
-
-// Monitor createStreamOutError: for API failures
-static id hook_createStreamOutError(id self, SEL _cmd, id *outError) {
-    BYPASS_LOG(@"createStreamOutError: called on %@", [self class]);
-
-    id result = orig_createStreamOutError(self, _cmd, outError);
-
-    if (!result) {
-        BYPASS_LOG(@"createStreamOutError: FAILED!");
-        if (outError && *outError) {
-            BYPASS_LOG(@"Error: %@", *outError);
-        }
-    } else {
-        BYPASS_LOG(@"createStreamOutError: SUCCESS - stream created");
-    }
-
-    return result;
-}
-
-// Monitor checkHTTPStreamIsValidAndSeek: - this is the entry point for stream validation
-static BOOL hook_checkHTTPStreamIsValidAndSeek(id self, SEL _cmd, BOOL seek) {
-    BOOL result = orig_checkHTTPStreamIsValidAndSeek(self, _cmd, seek);
-
-    if (!result) {
-        BYPASS_LOG(@"checkHTTPStreamIsValidAndSeek: FAILED for %@", self);
-        // Get the last error
-        id lastError = ((id(*)(id, SEL))objc_msgSend)(self, sel_registerName("lastError"));
-        if (lastError) {
-            BYPASS_LOG(@"Last error: %@", lastError);
-        }
-    }
-
-    return result;
-}
-
-// Monitor FCOperation.isSuccessful to catch API failures
-static BOOL hook_FCOperation_isSuccessful(id self, SEL _cmd) {
-    BOOL result = orig_FCOperation_isSuccessful(self, _cmd);
-
-    if (!result) {
-        // Only log for OAuth-related operations
-        NSString *className = NSStringFromClass([self class]);
-        if ([className containsString:@"OAuth"] || [className containsString:@"Cloud"] ||
-            [className containsString:@"Link"] || [className containsString:@"API"]) {
-            BYPASS_LOG(@"FCOperation FAILED: %@ (class: %@)", self, className);
-            id error = ((id(*)(id, SEL))objc_msgSend)(self, sel_registerName("operationError"));
-            if (error) {
-                BYPASS_LOG(@"Operation error: %@", error);
-            }
-        }
-    }
-
-    return result;
-}
-
-#pragma mark - OAuth Token Fix
-
-// Prevent token from being considered "about to expire"
-// This stops unnecessary token refresh attempts that may fail on sideloaded apps
-static BOOL hook_isAboutToExpire(id self, SEL _cmd) {
-    id expirationDate = ((id(*)(id, SEL))objc_msgSend)(self, sel_registerName("expirationDate"));
-    if (!expirationDate) {
-        return NO; // No expiration = never expires
-    }
-
-    // Only consider expired if ACTUALLY expired, not "about to expire"
-    NSTimeInterval remaining = [(NSDate *)expirationDate timeIntervalSinceNow];
-    if (remaining < 0) {
-        return YES; // Actually expired
-    }
-
-    return NO; // Not expired yet, don't refresh
-}
-
-// ============================================================================
-// MARK: - Initialization
-// ============================================================================
 
 __attribute__((constructor))
-static void InfuseBypassInit(void) {
-    BYPASS_LOG(@"Initializing Infuse 8.4.3 tvOS Sideload Bypass...");
+static void init(void) {
+    // 1. IAP
+    Class c = objc_getClass("_TtC6infuse31InAppPurchaseServiceFreemiumSK2");
+    if (c) hookInst(c, NSSelectorFromString(@"iapVersionStatus"), (IMP)h_iapVersionStatus, (IMP*)&orig_iapVersionStatus);
 
-    @autoreleasepool {
+    // 2. Reachability
+    c = objc_getClass("_TtC6infuse32DefaultSharesReachabilityManager");
+    if (c) hookInst(c, NSSelectorFromString(@"isShareAvailable:"), (IMP)h_isShareAvailable, (IMP*)&orig_isShareAvailable);
 
-        // ====================================================================
-        // IAP Bypass
-        // ====================================================================
+    // 3. Container
+    c = objc_getClass("NSFileManager");
+    hookInst(c, @selector(containerURLForSecurityApplicationGroupIdentifier:), (IMP)h_containerURL, (IMP*)&orig_containerURL);
 
-        Class FCEnvironmentClass = objc_getClass("FCEnvironment");
-        if (FCEnvironmentClass) {
-            swizzleClassMethod(FCEnvironmentClass,
-                sel_registerName("iapConfig"),
-                (IMP)hook_iapConfig,
-                (IMP*)&orig_iapConfig);
-        }
+    // 4 & 5. CloudKit
+    c = objc_getClass("CKContainer");
+    hookClass(c, @selector(defaultContainer), (IMP)h_defaultContainer, (IMP*)&orig_defaultContainer);
+    hookClass(c, @selector(containerWithIdentifier:), (IMP)h_containerWithId, (IMP*)&orig_containerWithId);
 
-        // Try multiple possible class names for IAP status
-        Class IAPServiceClass = objc_getClass("_TtC6infuse20IAPVersioningService");
-        if (!IAPServiceClass) IAPServiceClass = objc_getClass("IAPVersioningService");
-        if (IAPServiceClass) {
-            swizzleInstanceMethod(IAPServiceClass,
-                sel_registerName("iapVersionStatus"),
-                (IMP)hook_iapVersionStatus,
-                (IMP*)&orig_iapVersionStatus);
-        }
-
-        // ====================================================================
-        // Reachability Bypass (CRITICAL)
-        // ====================================================================
-
-        Class ReachabilityManagerClass = objc_getClass("_TtC6infuse32DefaultSharesReachabilityManager");
-        if (ReachabilityManagerClass) {
-            swizzleInstanceMethod(ReachabilityManagerClass,
-                sel_registerName("isShareAvailable:"),
-                (IMP)hook_isShareAvailable,
-                (IMP*)&orig_isShareAvailable);
-        }
-
-        // ====================================================================
-        // Connection Pool Fix
-        // ====================================================================
-
-        Class FCConnectionManagerClass = objc_getClass("FCConnectionManager");
-        if (FCConnectionManagerClass) {
-            swizzleInstanceMethod(FCConnectionManagerClass,
-                sel_registerName("maxConnections"),
-                (IMP)hook_maxConnections,
-                (IMP*)&orig_maxConnections);
-        }
-
-        // ====================================================================
-        // Stream Invalidation Fix
-        // ====================================================================
-
-        Class LinkStrategyClass = objc_getClass("FCCloudServiceLinkStreamStrategy");
-        if (LinkStrategyClass) {
-            swizzleInstanceMethod(LinkStrategyClass,
-                sel_registerName("shouldInvalidateStream:"),
-                (IMP)hook_shouldInvalidateStream,
-                (IMP*)&orig_shouldInvalidateStream);
-        }
-
-        Class GDriveStrategyClass = objc_getClass("FCGoogleDriveStreamStrategy");
-        if (GDriveStrategyClass) {
-            swizzleInstanceMethod(GDriveStrategyClass,
-                sel_registerName("shouldInvalidateStream:"),
-                (IMP)hook_shouldInvalidateStream_GDrive,
-                (IMP*)&orig_shouldInvalidateStream_GDrive);
-        }
-
-        Class MegaStrategyClass = objc_getClass("FCMeganzStreamStrategy");
-        if (MegaStrategyClass) {
-            swizzleInstanceMethod(MegaStrategyClass,
-                sel_registerName("shouldInvalidateStream:"),
-                (IMP)hook_shouldInvalidateStream_Mega,
-                (IMP*)&orig_shouldInvalidateStream_Mega);
-        }
-
-        // ====================================================================
-        // Container URL Redirect
-        // ====================================================================
-
-        Class NSFileManagerClass = objc_getClass("NSFileManager");
-        if (NSFileManagerClass) {
-            swizzleInstanceMethod(NSFileManagerClass,
-                sel_registerName("containerURLForSecurityApplicationGroupIdentifier:"),
-                (IMP)hook_containerURLForSecurityApplicationGroupIdentifier,
-                (IMP*)&orig_containerURLForSecurityApplicationGroupIdentifier);
-        }
-
-        // ====================================================================
-        // CloudKit Bypass
-        // ====================================================================
-
-        Class CKContainerClass = objc_getClass("CKContainer");
-        if (CKContainerClass) {
-            swizzleClassMethod(CKContainerClass,
-                sel_registerName("defaultContainer"),
-                (IMP)hook_CKContainer_defaultContainer,
-                (IMP*)&orig_CKContainer_defaultContainer);
-
-            swizzleClassMethod(CKContainerClass,
-                sel_registerName("containerWithIdentifier:"),
-                (IMP)hook_CKContainer_containerWithIdentifier,
-                (IMP*)&orig_CKContainer_containerWithIdentifier);
-        }
-
-        // ====================================================================
-        // HTTP Stream Debugging
-        // ====================================================================
-
-        Class FCHTTPInputStreamClass = objc_getClass("FCHTTPInputStream");
-        if (FCHTTPInputStreamClass) {
-            swizzleInstanceMethod(FCHTTPInputStreamClass,
-                sel_registerName("readHeadersAndFetchSizeForFile:"),
-                (IMP)hook_readHeadersAndFetchSizeForFile,
-                (IMP*)&orig_readHeadersAndFetchSizeForFile);
-
-            // Hook readBuffer:ofSize: DISABLED - causes crash
-            // TODO: fix objc_msgSend calls in hook_readBuffer_ofSize
-            // swizzleInstanceMethod(FCHTTPInputStreamClass,
-            //     sel_registerName("readBuffer:ofSize:"),
-            //     (IMP)hook_readBuffer_ofSize,
-            //     (IMP*)&orig_readBuffer_ofSize);
-        }
-
-        // ====================================================================
-        // OAuth Token Fix
-        // ====================================================================
-
-        Class FCOAuthTokenClass = objc_getClass("FCOAuthToken");
-        if (FCOAuthTokenClass) {
-            swizzleInstanceMethod(FCOAuthTokenClass,
-                sel_registerName("isAboutToExpire"),
-                (IMP)hook_isAboutToExpire,
-                (IMP*)&orig_isAboutToExpire);
-        }
-
-        // ====================================================================
-        // Cloud Stream API Monitoring (DIAGNOSTIC)
-        // ====================================================================
-
-        // Monitor createStreamOutError: on all strategies
-        if (LinkStrategyClass) {
-            swizzleInstanceMethod(LinkStrategyClass,
-                sel_registerName("createStreamOutError:"),
-                (IMP)hook_createStreamOutError,
-                (IMP*)&orig_createStreamOutError);
-        }
-
-        Class FCCloudInputStreamClass = objc_getClass("FCCloudInputStream");
-        if (FCCloudInputStreamClass) {
-            swizzleInstanceMethod(FCCloudInputStreamClass,
-                sel_registerName("checkHTTPStreamIsValidAndSeek:"),
-                (IMP)hook_checkHTTPStreamIsValidAndSeek,
-                (IMP*)&orig_checkHTTPStreamIsValidAndSeek);
-        }
-
-        // Monitor FCOperation for API failures
-        Class FCOperationClass = objc_getClass("FCOperation");
-        if (FCOperationClass) {
-            swizzleInstanceMethod(FCOperationClass,
-                sel_registerName("isSuccessful"),
-                (IMP)hook_FCOperation_isSuccessful,
-                (IMP*)&orig_FCOperation_isSuccessful);
-        }
-
-        BYPASS_LOG(@"Initialization complete!");
-    }
+    // 6. Content-Length fix
+    c = objc_getClass("FCHTTPInputStream");
+    if (c) hookInst(c, NSSelectorFromString(@"readHeadersAndFetchSizeForFile:"), (IMP)h_readHeaders, (IMP*)&orig_readHeaders);
 }
