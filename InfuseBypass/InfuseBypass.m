@@ -7,16 +7,15 @@
 //
 //  Hooks:
 //  1. iapVersionStatus → 1 (Pro active)
-//  2. isShareAvailable: → YES (fixes playback — reachability check
-//     kills connections for sideloaded apps)
-//  3. containerURLForSecurityApplicationGroupIdentifier: → Documents redirect
-//  4. CKContainer defaultContainer → nil
-//  5. CKContainer containerWithIdentifier: → nil
+//  2. isShareAvailable: → YES (reachability bypass)
+//  3. shouldInvalidateStream: → NO (prevent link expiration kills)
+//  4. containerURLForSecurityApplicationGroupIdentifier: → Documents redirect
+//  5. CKContainer defaultContainer → nil
+//  6. CKContainer containerWithIdentifier: → nil
 //
-//  Root cause of playback failure:
-//  FCCurlConnection.connect evaluates a connectionCheck block at 0x100018ca4
-//  which calls SharesReachabilityManager.isShareAvailable: — returns false
-//  for sideloaded apps, killing the stream before FFmpeg even opens.
+//  IDA finding: cloud protocols 28-31 bypass isShareAvailable: entirely,
+//  so some streams fail even with the reachability hook. Adding
+//  shouldInvalidateStream: and connection fixes covers all paths.
 //
 #import <Foundation/Foundation.h>
 #import <objc/runtime.h>
@@ -24,77 +23,84 @@
 @interface InfuseBypass : NSObject
 @end
 
+#pragma mark - Swizzle helpers
+
+static void swizzleInstance(Class cls, SEL orig, Class hook, SEL swiz) {
+    Method m1 = class_getInstanceMethod(cls, orig);
+    Method m2 = class_getInstanceMethod(hook, swiz);
+    if (m1 && m2) method_exchangeImplementations(m1, m2);
+}
+
+static void swizzleClass(Class cls, SEL orig, Class hook, SEL swiz) {
+    Method m1 = class_getClassMethod(cls, orig);
+    Method m2 = class_getClassMethod(hook, swiz);
+    if (m1 && m2) method_exchangeImplementations(m1, m2);
+}
+
 @implementation InfuseBypass
 
 + (void)load {
-    Class HookClass = InfuseBypass.class;
+    Class H = InfuseBypass.class;
 
     // ── IAP ───────────────────────────────────────────────────────────
     // 1. iapVersionStatus → 1 (Pro active)
     Class iapClass = objc_getClass("_TtC6infuse31InAppPurchaseServiceFreemiumSK2");
     if (iapClass) {
-        Method originalIapMethod = class_getInstanceMethod(iapClass, NSSelectorFromString(@"iapVersionStatus"));
-        Method swizzledIapMethod = class_getInstanceMethod(HookClass, @selector(hookedIapVersionStatus));
-        if (originalIapMethod && swizzledIapMethod) {
-            method_exchangeImplementations(originalIapMethod, swizzledIapMethod);
-        }
+        swizzleInstance(iapClass, NSSelectorFromString(@"iapVersionStatus"),
+                        H, @selector(hookedIapVersionStatus));
     }
 
-    // ── Reachability (PLAYBACK FIX) ──────────────────────────────────
-    // 2. SharesReachabilityManager.isShareAvailable: → YES
-    //    Without this, connectionCheck block returns 0 and the curl
-    //    connection aborts before even attempting the HTTP request.
+    // ── Stream / Reachability fixes ──────────────────────────────────
+    // 2. isShareAvailable: → YES (covers reachability-aware protocols)
     Class reachClass = objc_getClass("_TtC6infuse32DefaultSharesReachabilityManager");
     if (reachClass) {
-        Method originalReachMethod = class_getInstanceMethod(reachClass, NSSelectorFromString(@"isShareAvailable:"));
-        Method swizzledReachMethod = class_getInstanceMethod(HookClass, @selector(hookedIsShareAvailable:));
-        if (originalReachMethod && swizzledReachMethod) {
-            method_exchangeImplementations(originalReachMethod, swizzledReachMethod);
-        }
+        swizzleInstance(reachClass, NSSelectorFromString(@"isShareAvailable:"),
+                        H, @selector(hookedIsShareAvailable:));
+    }
+
+    // 3. shouldInvalidateStream: → NO (covers cloud protocols 28-31
+    //    that bypass reachability — prevents link expiration check
+    //    from killing active streams)
+    Class linkStratClass = objc_getClass("FCCloudServiceLinkStreamStrategy");
+    if (linkStratClass) {
+        swizzleInstance(linkStratClass, NSSelectorFromString(@"shouldInvalidateStream:"),
+                        H, @selector(hookedShouldInvalidateStream:));
     }
 
     // ── Container redirect ───────────────────────────────────────────
-    // 3. containerURLForSecurityApplicationGroupIdentifier: → Documents
-    Class fileManagerClass = objc_getClass("NSFileManager");
-    Method originalFMMethod = class_getInstanceMethod(fileManagerClass, @selector(containerURLForSecurityApplicationGroupIdentifier:));
-    Method swizzledFMMethod = class_getInstanceMethod(HookClass, @selector(hookedContainerURLForSecurityApplicationGroupIdentifier:));
-    if (originalFMMethod && swizzledFMMethod) {
-        method_exchangeImplementations(originalFMMethod, swizzledFMMethod);
-    }
+    // 4. containerURLForSecurityApplicationGroupIdentifier: → Documents
+    Class fmClass = objc_getClass("NSFileManager");
+    swizzleInstance(fmClass,
+                    @selector(containerURLForSecurityApplicationGroupIdentifier:),
+                    H, @selector(hookedContainerURLForSecurityApplicationGroupIdentifier:));
 
     // ── CloudKit disable ─────────────────────────────────────────────
-    // 4 & 5. CKContainer → nil
-    Class cloudKitClass = objc_getClass("CKContainer");
-    Method originalDefaultMethod = class_getClassMethod(cloudKitClass, @selector(defaultContainer));
-    Method swizzledDefaultMethod = class_getClassMethod(HookClass, @selector(hookedDefaultContainer));
-    if (originalDefaultMethod && swizzledDefaultMethod) {
-        method_exchangeImplementations(originalDefaultMethod, swizzledDefaultMethod);
-    }
-
-    Method originalIdentifierMethod = class_getClassMethod(cloudKitClass, @selector(containerWithIdentifier:));
-    Method swizzledIdentifierMethod = class_getClassMethod(HookClass, @selector(hookedContainerWithIdentifier:));
-    if (originalIdentifierMethod && swizzledIdentifierMethod) {
-        method_exchangeImplementations(originalIdentifierMethod, swizzledIdentifierMethod);
-    }
+    // 5 & 6. CKContainer → nil
+    Class ckClass = objc_getClass("CKContainer");
+    swizzleClass(ckClass, @selector(defaultContainer),
+                 H, @selector(hookedDefaultContainer));
+    swizzleClass(ckClass, @selector(containerWithIdentifier:),
+                 H, @selector(hookedContainerWithIdentifier:));
 }
 
 #pragma mark - IAP
 
-// Hook 1 — return 1 (FCIAPVersionStatus pro active)
 - (NSInteger)hookedIapVersionStatus {
     return 1;
 }
 
-#pragma mark - Reachability (playback fix)
+#pragma mark - Stream fixes
 
-// Hook 2 — force all shares as reachable
 - (BOOL)hookedIsShareAvailable:(id)share {
     return YES;
 }
 
+- (BOOL)hookedShouldInvalidateStream:(id)stream {
+    return NO;
+}
+
 #pragma mark - Container redirect
 
-// Hook 3 — redirect group container to Documents
 - (NSURL *)hookedContainerURLForSecurityApplicationGroupIdentifier:(NSString *)groupIdentifier {
     NSString *homeDirectory = NSHomeDirectory();
     NSString *containerBasePath = [homeDirectory stringByAppendingPathComponent:@"Documents/ApplicationGroupContainers"];
@@ -125,12 +131,10 @@
 
 #pragma mark - CloudKit disable
 
-// Hook 4
 + (id)hookedDefaultContainer {
     return nil;
 }
 
-// Hook 5
 + (id)hookedContainerWithIdentifier:(NSString *)identifier {
     return nil;
 }
