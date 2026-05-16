@@ -476,11 +476,12 @@ static void InfuseBypassInit(void) {
                 (IMP)hook_readHeadersAndFetchSizeForFile,
                 (IMP*)&orig_readHeadersAndFetchSizeForFile);
 
-            // Hook readBuffer:ofSize: to handle EOF when Content-Length was faked
-            swizzleInstanceMethod(FCHTTPInputStreamClass,
-                sel_registerName("readBuffer:ofSize:"),
-                (IMP)hook_readBuffer_ofSize,
-                (IMP*)&orig_readBuffer_ofSize);
+            // Hook readBuffer:ofSize: DISABLED - causes crash
+            // TODO: fix objc_msgSend calls in hook_readBuffer_ofSize
+            // swizzleInstanceMethod(FCHTTPInputStreamClass,
+            //     sel_registerName("readBuffer:ofSize:"),
+            //     (IMP)hook_readBuffer_ofSize,
+            //     (IMP*)&orig_readBuffer_ofSize);
         }
 
         // ====================================================================
