@@ -67,15 +67,13 @@ static long long h_readHeaders(id self, SEL _cmd, void *file) {
     return result;
 }
 
-// === Hook 7: Disable byte seeking for streams ===
+// === Hook 7: DISABLED - testing without seek control ===
 static BOOL h_canUseByteSeek(id self, SEL _cmd) {
-    if (g_streamingMode) return NO;
     return orig_canUseByteSeek(self, _cmd);
 }
 
-// === Hook 8: Return unknown size for FFmpeg ===
+// === Hook 8: DISABLED - testing without length override ===
 static long long h_length(id self, SEL _cmd) {
-    if (g_streamingMode) return -1;
     return orig_length(self, _cmd);
 }
 
