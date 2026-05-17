@@ -62,26 +62,21 @@ static long long h_readHeaders(id self, SEL _cmd, void *file) {
     long long result = orig_readHeaders(self, _cmd, file);
     if (result < 0) {
         g_streamingMode = YES;
-        return 0;
+        return 1; // minimal positive value, passes any > 0 or >= 0 check
     }
     return result;
 }
 
 // === Hook 7: Disable byte seeking for streams ===
-// When canUseByteSeek returns NO, AVIO context seekable = 0.
-// FFmpeg won't try to seek in the stream.
 static BOOL h_canUseByteSeek(id self, SEL _cmd) {
     if (g_streamingMode) return NO;
     return orig_canUseByteSeek(self, _cmd);
 }
 
 // === Hook 8: Return unknown size for FFmpeg ===
-// AVIO seek callback calls [inputStream length] for AVSEEK_SIZE.
-// FFmpeg treats -1 as unknown size → streaming mode.
 static long long h_length(id self, SEL _cmd) {
-    long long size = orig_length(self, _cmd);
-    if (size == 0 && g_streamingMode) return -1;
-    return size;
+    if (g_streamingMode) return -1;
+    return orig_length(self, _cmd);
 }
 
 __attribute__((constructor))
