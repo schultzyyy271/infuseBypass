@@ -1,13 +1,7 @@
-//
 //  InfuseBypass.m — Infuse 8.4.3 tvOS Sideload Bypass
-//
-//  Proven hooks + User-Agent/Range header fix for MovieBox Pro streams
-//
+
 #import <Foundation/Foundation.h>
 #import <objc/runtime.h>
-
-// Original pointer for header hook
-static id (*orig_initHeaders)(id, SEL, id, BOOL);
 
 @interface InfuseBypass : NSObject
 @end
@@ -47,36 +41,6 @@ static id (*orig_initHeaders)(id, SEL, id, BOOL);
     Method o5 = class_getClassMethod(ck, @selector(containerWithIdentifier:));
     Method s5 = class_getClassMethod(H, @selector(h_containerWithId:));
     if (o5 && s5) method_exchangeImplementations(o5, s5);
-
-    // 6. HTTP headers fix — change User-Agent + remove Range header
-    //    MovieBox CDN may omit Content-Length when it sees Infuse's User-Agent
-    //    or when it sees Range header (switches to chunked transfer)
-    Class hdr = objc_getClass("FCHTTPHeadersHandler");
-    if (hdr) {
-        Method m = class_getInstanceMethod(hdr, NSSelectorFromString(@"initWithRequestHeaders:dropHost:"));
-        if (m) {
-            orig_initHeaders = (id(*)(id, SEL, id, BOOL))method_getImplementation(m);
-            method_setImplementation(m, (IMP)hook_initHeaders);
-        }
-    }
-}
-
-// Hook 6 — Modify HTTP headers
-static id hook_initHeaders(id self, SEL _cmd, id headers, BOOL dropHost) {
-    if (headers && [headers isKindOfClass:[NSDictionary class]]) {
-        NSMutableDictionary *mod = [headers mutableCopy];
-
-        // Swap User-Agent to browser-like string
-        mod[@"User-Agent"] = @"Mozilla/5.0 (AppleTV; U; CPU OS 18_0 like Mac OS X) "
-                             @"AppleWebKit/605.1.15 (KHTML, like Gecko) Version/18.0 Safari/605.1.15";
-
-        // Remove Range header on initial request — some CDNs skip
-        // Content-Length when they see Range and use chunked instead
-        [mod removeObjectForKey:@"Range"];
-
-        return orig_initHeaders(self, _cmd, mod, dropHost);
-    }
-    return orig_initHeaders(self, _cmd, headers, dropHost);
 }
 
 - (NSInteger)h_iapVersionStatus { return 1; }
