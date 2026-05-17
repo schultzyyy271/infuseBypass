@@ -1,11 +1,18 @@
 //
 //  InfuseBypass.m — Infuse 8.4.3 tvOS Sideload Fix
 //
-//  Proven hooks + Content-Length fix for MovieBox Pro streams
+//  IDA-traced streaming mode fix for MovieBox Pro:
+//  - readHeadersAndFetchSizeForFile → 0 (passes >= 0 check)
+//  - canUseByteSeek → NO (AVIO seekable = 0)
+//  - length → -1 (AVSEEK_SIZE unknown)
+//  - readBuffer:ofSize: → 0 at EOF (AVERROR_EOF)
 //
 #import <Foundation/Foundation.h>
 #import <objc/runtime.h>
 #import <objc/message.h>
+
+// Thread-local streaming mode flag
+static _Atomic BOOL g_streamingMode = NO;
 
 // Original method pointers
 static NSInteger (*orig_iapVersionStatus)(id, SEL);
@@ -14,15 +21,17 @@ static NSURL* (*orig_containerURL)(id, SEL, NSString*);
 static id (*orig_defaultContainer)(id, SEL);
 static id (*orig_containerWithId)(id, SEL, NSString*);
 static long long (*orig_readHeaders)(id, SEL, void*);
+static BOOL (*orig_canUseByteSeek)(id, SEL);
+static long long (*orig_length)(id, SEL);
 
 // Swizzle helpers
-static void hookInst(Class c, SEL s, IMP new, IMP *old) {
+static void hookInst(Class c, SEL s, IMP new_imp, IMP *old) {
     Method m = class_getInstanceMethod(c, s);
-    if (m) *old = method_setImplementation(m, new);
+    if (m) { *old = method_setImplementation(m, new_imp); }
 }
-static void hookClass(Class c, SEL s, IMP new, IMP *old) {
+static void hookClass(Class c, SEL s, IMP new_imp, IMP *old) {
     Method m = class_getClassMethod(c, s);
-    if (m) *old = method_setImplementation(m, new);
+    if (m) { *old = method_setImplementation(m, new_imp); }
 }
 
 // === Hook 1: Pro status ===
@@ -44,21 +53,43 @@ static NSURL* h_containerURL(id self, SEL _cmd, NSString *gid) {
 static id h_defaultContainer(id self, SEL _cmd) { return nil; }
 static id h_containerWithId(id self, SEL _cmd, NSString *i) { return nil; }
 
-// === Hook 6: Content-Length fix (MovieBox Pro) ===
-// MovieBox CDN doesn't send Content-Length headers.
-// VLC streams until EOF, Infuse returns -1 and fails.
-// Fix: return fake size so stream opens, Infuse reads until EOF.
+// === Hook 6: Content-Length fix ===
+// Return 0 instead of -1 when Content-Length missing.
+// Infuse only checks (result & 0x8000000000000000) == 0, so 0 passes.
+// g_streamingMode signals other hooks to enable streaming behavior.
 static long long h_readHeaders(id self, SEL _cmd, void *file) {
     if (!file) return -1;
     long long result = orig_readHeaders(self, _cmd, file);
-    if (result < 0) return 10737418240LL; // 10GB fake
+    if (result < 0) {
+        g_streamingMode = YES;
+        return 0;
+    }
     return result;
+}
+
+// === Hook 7: Disable byte seeking for streams ===
+// When canUseByteSeek returns NO, AVIO context seekable = 0.
+// FFmpeg won't try to seek in the stream.
+static BOOL h_canUseByteSeek(id self, SEL _cmd) {
+    if (g_streamingMode) return NO;
+    return orig_canUseByteSeek(self, _cmd);
+}
+
+// === Hook 8: Return unknown size for FFmpeg ===
+// AVIO seek callback calls [inputStream length] for AVSEEK_SIZE.
+// FFmpeg treats -1 as unknown size → streaming mode.
+static long long h_length(id self, SEL _cmd) {
+    long long size = orig_length(self, _cmd);
+    if (size == 0 && g_streamingMode) return -1;
+    return size;
 }
 
 __attribute__((constructor))
 static void init(void) {
+    Class c;
+
     // 1. IAP
-    Class c = objc_getClass("_TtC6infuse31InAppPurchaseServiceFreemiumSK2");
+    c = objc_getClass("_TtC6infuse31InAppPurchaseServiceFreemiumSK2");
     if (c) hookInst(c, NSSelectorFromString(@"iapVersionStatus"), (IMP)h_iapVersionStatus, (IMP*)&orig_iapVersionStatus);
 
     // 2. Reachability
@@ -76,5 +107,13 @@ static void init(void) {
 
     // 6. Content-Length fix
     c = objc_getClass("FCHTTPInputStream");
-    if (c) hookInst(c, NSSelectorFromString(@"readHeadersAndFetchSizeForFile:"), (IMP)h_readHeaders, (IMP*)&orig_readHeaders);
+    if (c) {
+        hookInst(c, NSSelectorFromString(@"readHeadersAndFetchSizeForFile:"), (IMP)h_readHeaders, (IMP*)&orig_readHeaders);
+        // 8. Length → -1 for FFmpeg AVSEEK_SIZE
+        hookInst(c, NSSelectorFromString(@"length"), (IMP)h_length, (IMP*)&orig_length);
+    }
+
+    // 7. Disable seeking for streams
+    c = objc_getClass("FCFFMPEGDemuxingStream");
+    if (c) hookInst(c, NSSelectorFromString(@"canUseByteSeek"), (IMP)h_canUseByteSeek, (IMP*)&orig_canUseByteSeek);
 }
